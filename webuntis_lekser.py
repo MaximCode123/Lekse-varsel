@@ -66,10 +66,8 @@ def login(session):
     resp = session.post(url, data=data, headers=headers, allow_redirects=True)
     if "invalidLogin" in resp.url:
         raise Exception("Innlogging feilet!")
-
-    # Sett Tenant-Id cookie slik nettleseren gjør
     session.cookies.set("Tenant-Id", '"7418800"', domain=WEBUNTIS_SERVER, path="/WebUntis")
-    print(f"✅ Logget inn, cookies: {dict(session.cookies)}")
+    print("✅ Logget inn")
 
 
 def get_notes(session):
@@ -83,6 +81,7 @@ def get_notes(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
+    # Hent ukentlig timeplan
     url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/public/timetable/weekly/data"
     params = {
         "elementType": 5,
@@ -93,24 +92,30 @@ def get_notes(session):
     resp = session.get(url, params=params, headers=headers)
     data = resp.json()
     result = data.get("data", {}).get("result", {}).get("data", {})
-    elements = result.get("elements", [])
     periods = result.get("elementPeriods", {}).get(str(WEBUNTIS_ELEMENT_ID), [])
-    subject_map = {e["id"]: e.get("longName", e.get("name", "Ukjent")) for e in elements if e.get("type") == 3}
 
-    print(f"Fant {len(periods)} timer denne uken")
-
-    notes = []
-    seen_lesson_ids = set()
-
+    # Grupper timer per lessonId – finn start på første og slutt på siste
+    from collections import defaultdict
+    lesson_groups = defaultdict(list)
     for period in periods:
         lesson_id = period.get("lessonId")
-        if lesson_id in seen_lesson_ids:
-            continue
-        seen_lesson_ids.add(lesson_id)
+        if lesson_id:
+            lesson_groups[lesson_id].append(period)
 
-        date_raw = str(period.get("date", ""))
-        start_time = str(period.get("startTime", "0000")).zfill(4)
-        end_time = str(period.get("endTime", "0000")).zfill(4)
+    print(f"Fant {len(lesson_groups)} unike leksjoner denne uken")
+
+    notes = []
+
+    for lesson_id, lesson_periods in lesson_groups.items():
+        # Sorter etter dato og starttid
+        lesson_periods.sort(key=lambda p: (p.get("date", 0), p.get("startTime", 0)))
+
+        first = lesson_periods[0]
+        last = lesson_periods[-1]
+
+        date_raw = str(first.get("date", ""))
+        start_time = str(first.get("startTime", "0000")).zfill(4)
+        end_time = str(last.get("endTime", "0000")).zfill(4)
 
         try:
             d = datetime.strptime(date_raw, "%Y%m%d")
@@ -119,7 +124,6 @@ def get_notes(session):
         except Exception:
             continue
 
-        # URL-kode koloner slik nettleseren gjør
         start_enc = start_dt.replace(":", "%3A")
         end_enc = end_dt.replace(":", "%3A")
 
@@ -132,15 +136,12 @@ def get_notes(session):
         )
 
         detail_resp = session.get(detail_url, headers=headers)
-        print(f"  detail status: {detail_resp.status_code} url: {detail_url[-80:]}")
+        print(f"  {start_dt} → {end_dt}: status {detail_resp.status_code}")
+
         if detail_resp.status_code != 200:
-            print(f"  respons: {detail_resp.text[:200]}")
             continue
 
-        detail_data = detail_resp.json()
-        print(f"  keys: {list(detail_data.keys())}, entries: {len(detail_data.get('calendarEntries', []))}")
-        entries = detail_data.get("calendarEntries", [])
-
+        entries = detail_resp.json().get("calendarEntries", [])
         for entry in entries:
             notes_text = (entry.get("notesAll") or "").strip()
             if not notes_text:
@@ -178,6 +179,7 @@ def main():
     login(session)
     notes = get_notes(session)
 
+    # Dedupliser
     seen_texts = set()
     unique_notes = []
     for n in notes:
