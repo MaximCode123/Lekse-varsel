@@ -1,6 +1,6 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
-Bruker JSON-RPC for å hente timeplan og notater
+Bruker /api/rest/view/v2/calendar-entry/detail
 """
 
 import requests
@@ -14,6 +14,7 @@ WEBUNTIS_SERVER   = os.environ.get("WEBUNTIS_SERVER", "")
 WEBUNTIS_SCHOOL   = os.environ.get("WEBUNTIS_SCHOOL", "")
 WEBUNTIS_USERNAME = os.environ.get("WEBUNTIS_USERNAME", "")
 WEBUNTIS_PASSWORD = os.environ.get("WEBUNTIS_PASSWORD", "")
+WEBUNTIS_ELEMENT_ID = os.environ.get("WEBUNTIS_ELEMENT_ID", "1859")  # Din student-ID
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "")
 
@@ -71,96 +72,72 @@ def login(session):
     print("✅ Logget inn")
 
 
-def rpc_call(session, method, params={}):
-    url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
-    payload = {"id": method, "method": method, "params": params, "jsonrpc": "2.0"}
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
-    }
-    resp = session.post(url, json=payload, headers=headers,
-                        params={"school": WEBUNTIS_SCHOOL})
-    data = resp.json()
-    if "error" in data:
-        print(f"RPC feil for {method}: {data['error']}")
-        return None
-    return data.get("result")
-
-
 def get_notes(session):
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
-    start = int(monday.strftime("%Y%m%d"))
-    end = int(sunday.strftime("%Y%m%d"))
 
-    # Hent brukerinfo via getStudents / getPersonId
-    person_id = None
-    person_type = 5  # 5 = student
+    # Format: 2026-03-09T00:00:00
+    start = monday.strftime("%Y-%m-%dT00%%3A00%%3A00")
+    end = sunday.strftime("%Y-%m-%dT23%%3A59%%3A59")
 
-    # Prøv å hente min egen ID
-    students = rpc_call(session, "getStudents")
-    print(f"getStudents: {str(students)[:300]}")
+    url = (f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v2/calendar-entry/detail"
+           f"?elementId={WEBUNTIS_ELEMENT_ID}&elementType=5"
+           f"&endDateTime={sunday.strftime('%Y-%m-%dT23:59:59')}"
+           f"&homeworkOption=DUE"
+           f"&startDateTime={monday.strftime('%Y-%m-%dT00:00:00')}")
 
-    if students:
-        for s in students:
-            if s.get("name", "").lower() == WEBUNTIS_USERNAME.lower() or \
-               s.get("longName", "").lower() == WEBUNTIS_USERNAME.lower():
-                person_id = s.get("id")
-                print(f"✅ Fant student ID: {person_id} ({s.get('longName')})")
-                break
-
-        if not person_id and students:
-            # Vis første 5 studenter for debugging
-            print("Første studenter:", [(s.get("id"), s.get("name"), s.get("longName")) for s in students[:5]])
-
-    # Hent timeplan
-    params = {
-        "id": person_id or 0,
-        "type": person_type,
-        "startDate": start,
-        "endDate": end,
-        "fields": ["id", "date", "startTime", "endTime", "subjects", "lstext", "activityType"]
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    timetable = rpc_call(session, "getTimetable", params)
-    print(f"getTimetable: fant {len(timetable) if timetable else 0} timer")
-    if timetable:
-        print(f"Eksempel time: {timetable[0]}")
+    resp = session.get(url, headers=headers)
+    print(f"Calendar API status: {resp.status_code}")
+    print(f"Respons: {resp.text[:800]}")
 
+    if resp.status_code != 200 or not resp.text.strip().startswith("{"):
+        return []
+
+    data = resp.json()
     notes = []
-    if not timetable:
-        return notes
 
-    # Hent faginfo
-    subjects_list = rpc_call(session, "getSubjects") or []
-    subject_map = {s["id"]: s.get("name", s.get("longName", "Ukjent")) for s in subjects_list}
+    # Parse responsen
+    entries = data.get("data", data) if isinstance(data.get("data"), list) else []
+    if not entries and isinstance(data, list):
+        entries = data
 
-    for period in timetable:
-        lstext = period.get("lstext", "").strip()
-        if not lstext:
+    print(f"Antall entries: {len(entries)}")
+
+    for entry in entries:
+        # Finn notater/lstext
+        lstext = (entry.get("lstext") or entry.get("lessonText") or
+                  entry.get("studentGroup") or entry.get("text") or "").strip()
+        info = (entry.get("studentGroup") or entry.get("info") or "").strip()
+
+        # Kombiner tilgjengelig tekst
+        text = lstext or info
+        if not text:
             continue
 
-        # Finn fagnavn
-        subject = "Ukjent fag"
-        subj_ids = [s["id"] for s in period.get("su", period.get("subjects", []))]
-        if subj_ids:
-            subject = subject_map.get(subj_ids[0], "Ukjent fag")
+        subject = (entry.get("subject") or entry.get("subjectName") or
+                   entry.get("lessonSubject") or "Ukjent fag")
 
-        date_raw = str(period.get("date", ""))
+        date_raw = entry.get("date") or entry.get("startDateTime", "")[:10]
         try:
-            due_date = datetime.strptime(date_raw, "%Y%m%d").strftime("%d.%m.%Y")
+            due_date = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d.%m.%Y")
         except Exception:
             due_date = date_raw
 
         notes.append({
             "subject": subject,
-            "text": lstext,
+            "text": text,
             "date": due_date,
             "raw_date": date_raw,
         })
-        print(f"  📝 {subject} ({due_date}): {lstext[:80]}")
+        print(f"  📝 {subject} ({due_date}): {text[:80]}")
 
     return notes
 
