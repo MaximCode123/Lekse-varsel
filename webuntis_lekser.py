@@ -1,5 +1,6 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
+Henter notesAll fra calendar-entry/detail API
 """
 
 import requests
@@ -64,7 +65,6 @@ def login(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
     resp = session.post(url, data=data, headers=headers, allow_redirects=True)
-    print(f"Login status: {resp.status_code}")
     if "invalidLogin" in resp.url:
         raise Exception("Innlogging feilet!")
     print("✅ Logget inn")
@@ -73,6 +73,7 @@ def login(session):
 def get_notes(session):
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -81,7 +82,7 @@ def get_notes(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    # Hent ukentlig timeplan
+    # Hent ukentlig timeplan for å få alle timer
     url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/public/timetable/weekly/data"
     params = {
         "elementType": 5,
@@ -94,14 +95,13 @@ def get_notes(session):
     result = data.get("data", {}).get("result", {}).get("data", {})
     elements = result.get("elements", [])
     periods = result.get("elementPeriods", {}).get(str(WEBUNTIS_ELEMENT_ID), [])
+    subject_map = {e["id"]: e.get("longName", e.get("name", "Ukjent")) for e in elements if e.get("type") == 3}
 
-    subject_map = {e["id"]: e.get("name", "Ukjent") for e in elements if e.get("type") == 3}
     print(f"Fant {len(periods)} timer denne uken")
 
     notes = []
+    seen_lesson_ids = set()
 
-    # Sjekk første time for å se hva detail-API returnerer
-    first_logged = False
     for period in periods:
         date_raw = str(period.get("date", ""))
         start_time = str(period.get("startTime", "0000")).zfill(4)
@@ -114,6 +114,12 @@ def get_notes(session):
         except Exception:
             continue
 
+        # Unngå å hente samme lessonId flere ganger
+        lesson_id = period.get("lessonId")
+        if lesson_id in seen_lesson_ids:
+            continue
+        seen_lesson_ids.add(lesson_id)
+
         detail_url = (
             f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v2/calendar-entry/detail"
             f"?elementId={WEBUNTIS_ELEMENT_ID}&elementType=5"
@@ -123,85 +129,31 @@ def get_notes(session):
         )
 
         detail_resp = session.get(detail_url, headers=headers)
-
-        # Log de første 3 timene for å forstå strukturen
-        if not first_logged or period.get("lessonText", ""):
-            print(f"\nTime {start_dt}: status={detail_resp.status_code}")
-            print(f"  URL: ...{detail_url[-100:]}")
-            print(f"  Respons: {detail_resp.text[:400]}")
-            first_logged = True
-
         if detail_resp.status_code != 200:
             continue
 
-        detail = detail_resp.json()
-
-        # Håndter ulike strukturer
-        if isinstance(detail, list):
-            entries = detail
-        elif isinstance(detail, dict):
-            entries = detail.get("data", [detail])
-            if not isinstance(entries, list):
-                entries = [entries]
-        else:
-            continue
+        detail_data = detail_resp.json()
+        entries = detail_data.get("calendarEntries", [])
 
         for entry in entries:
-            # Søk etter tekst i alle mulige felt
-            text_fields = ["lstext", "lessonText", "text", "periodText",
-                          "studentText", "teacherText", "info", "remark"]
-            text = ""
-            for field in text_fields:
-                val = entry.get(field, "").strip()
-                if val:
-                    text = val
-                    break
-
-            if not text:
+            notes_text = (entry.get("notesAll") or "").strip()
+            if not notes_text:
                 continue
 
-            subject = "Ukjent fag"
-            for el in period.get("elements", []):
-                if el.get("type") == 3:
-                    subject = subject_map.get(el.get("id"), "Ukjent fag")
-                    break
-
-            due_date = d.strftime("%d.%m.%Y")
-            notes.append({
-                "subject": subject,
-                "text": text,
-                "date": due_date,
-                "raw_date": d.strftime("%Y-%m-%d"),
-            })
-            print(f"  📝 {subject} ({due_date}): {text[:80]}")
-
-    # Sjekk også lessonText direkte fra timeplanen
-    print("\n--- Sjekker lessonText direkte fra timeplan ---")
-    for period in periods:
-        lstext = period.get("lessonText", "").strip()
-        period_text = period.get("periodText", "").strip()
-        if lstext or period_text:
-            date_raw = str(period.get("date", ""))
+            subject = entry.get("subject", {}).get("longName", "Ukjent fag")
+            date_str = entry.get("startDateTime", "")[:10]
             try:
-                d = datetime.strptime(date_raw, "%Y%m%d")
-                due_date = d.strftime("%d.%m.%Y")
+                due_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
             except Exception:
-                due_date = date_raw
+                due_date = date_str
 
-            subject = "Ukjent fag"
-            for el in period.get("elements", []):
-                if el.get("type") == 3:
-                    subject = subject_map.get(el.get("id"), "Ukjent fag")
-                    break
-
-            text = lstext or period_text
-            print(f"  📝 lessonText: {subject} ({due_date}): {text[:80]}")
             notes.append({
                 "subject": subject,
-                "text": text,
+                "text": notes_text,
                 "date": due_date,
-                "raw_date": d.strftime("%Y-%m-%d") if isinstance(d, datetime) else date_raw,
+                "raw_date": date_str,
             })
+            print(f"  📝 {subject} ({due_date}): {notes_text[:80]}")
 
     return notes
 
@@ -230,7 +182,7 @@ def main():
             unique_notes.append(n)
     notes = unique_notes
 
-    print(f"\n📋 Fant {len(notes)} unike notater denne uken")
+    print(f"\n📋 Fant {len(notes)} notater denne uken")
 
     new_notes = []
     for n in notes:
