@@ -1,6 +1,5 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
-Bruker WebUntis API direkte med requests
 """
 
 import requests
@@ -17,7 +16,6 @@ PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "")
 
 SEEN_HOMEWORK_FILE = "seen_homework.json"
-BASE_URL = f"https://{{server}}/WebUntis"
 
 
 def load_seen_homework():
@@ -48,30 +46,34 @@ def send_pushover(title: str, message: str):
     print(f"✅ Pushover-varsel sendt: {title}")
 
 
-def login(session, server, school, username, password):
-    """Logg inn via cookies (nyere WebUntis-metode)"""
-    url = f"https://{server}/WebUntis/j_spring_security_check"
+def login(session):
+    """Logg inn og sett skolecookie"""
+    # Sett skolenavn som cookie først
+    session.cookies.set("schoolname", WEBUNTIS_SCHOOL, domain=WEBUNTIS_SERVER)
+
+    url = f"https://{WEBUNTIS_SERVER}/WebUntis/j_spring_security_check"
     data = {
-        "school": school,
-        "j_username": username,
-        "j_password": password,
+        "school": WEBUNTIS_SCHOOL,
+        "j_username": WEBUNTIS_USERNAME,
+        "j_password": WEBUNTIS_PASSWORD,
         "token": ""
     }
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
     resp = session.post(url, data=data, headers=headers, allow_redirects=True)
-    
-    # Sjekk om vi er logget inn
+
     if "invalidLogin" in resp.url or "error" in resp.url.lower():
-        raise Exception(f"Innlogging feilet! Sjekk brukernavn/passord. URL: {resp.url}")
-    
-    print(f"✅ Logget inn (status: {resp.status_code})")
+        raise Exception(f"Innlogging feilet! URL: {resp.url}")
+
+    print(f"✅ Logget inn")
+    print(f"   Cookies: {dict(session.cookies)}")
     return session
 
 
-def get_homework(session, server, school):
+def get_homework(session):
     """Hent lekser for denne uken"""
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
@@ -80,15 +82,20 @@ def get_homework(session, server, school):
     start = monday.strftime("%Y-%m-%d")
     end = sunday.strftime("%Y-%m-%d")
 
-    url = f"https://{server}/WebUntis/api/homeworks/lessons"
+    url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/homeworks/lessons"
     params = {"startDate": start, "endDate": end}
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
+    }
 
     resp = session.get(url, params=params, headers=headers)
     print(f"Homework API status: {resp.status_code}")
-    
-    if resp.status_code != 200:
-        print(f"Respons: {resp.text[:300]}")
+    print(f"Respons (første 500 tegn): {resp.text[:500]}")
+
+    if resp.status_code != 200 or not resp.text.strip():
+        print("Tom eller ugyldig respons fra lekse-API")
         return []
 
     data = resp.json()
@@ -127,9 +134,8 @@ def main():
     today = datetime.now()
 
     session = requests.Session()
-
-    login(session, WEBUNTIS_SERVER, WEBUNTIS_SCHOOL, WEBUNTIS_USERNAME, WEBUNTIS_PASSWORD)
-    homeworks = get_homework(session, WEBUNTIS_SERVER, WEBUNTIS_SCHOOL)
+    login(session)
+    homeworks = get_homework(session)
 
     print(f"📋 Fant {len(homeworks)} lekser denne uken")
 
