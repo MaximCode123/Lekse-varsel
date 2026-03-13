@@ -129,10 +129,13 @@ def get_notes(session):
         )
 
         detail_resp = session.get(detail_url, headers=headers)
+        print(f"  detail status: {detail_resp.status_code} url: {detail_url[-80:]}")
         if detail_resp.status_code != 200:
+            print(f"  respons: {detail_resp.text[:200]}")
             continue
 
         detail_data = detail_resp.json()
+        print(f"  keys: {list(detail_data.keys())}, entries: {len(detail_data.get('calendarEntries', []))}")
         entries = detail_data.get("calendarEntries", [])
 
         for entry in entries:
