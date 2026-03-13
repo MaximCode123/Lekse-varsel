@@ -1,6 +1,5 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
-Bruker /api/rest/view/v2/calendar-entry/detail
 """
 
 import requests
@@ -10,13 +9,13 @@ from datetime import datetime, timedelta
 import hashlib
 import base64
 
-WEBUNTIS_SERVER   = os.environ.get("WEBUNTIS_SERVER", "")
-WEBUNTIS_SCHOOL   = os.environ.get("WEBUNTIS_SCHOOL", "")
-WEBUNTIS_USERNAME = os.environ.get("WEBUNTIS_USERNAME", "")
-WEBUNTIS_PASSWORD = os.environ.get("WEBUNTIS_PASSWORD", "")
-WEBUNTIS_ELEMENT_ID = os.environ.get("WEBUNTIS_ELEMENT_ID", "1859")  # Din student-ID
-PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "")
-PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "")
+WEBUNTIS_SERVER     = os.environ.get("WEBUNTIS_SERVER", "")
+WEBUNTIS_SCHOOL     = os.environ.get("WEBUNTIS_SCHOOL", "")
+WEBUNTIS_USERNAME   = os.environ.get("WEBUNTIS_USERNAME", "")
+WEBUNTIS_PASSWORD   = os.environ.get("WEBUNTIS_PASSWORD", "")
+WEBUNTIS_ELEMENT_ID = os.environ.get("WEBUNTIS_ELEMENT_ID", "1859")
+PUSHOVER_USER_KEY   = os.environ.get("PUSHOVER_USER_KEY", "")
+PUSHOVER_APP_TOKEN  = os.environ.get("PUSHOVER_APP_TOKEN", "")
 
 SEEN_HOMEWORK_FILE = "seen_homework.json"
 
@@ -52,7 +51,6 @@ def send_pushover(title: str, message: str):
 def login(session):
     school_cookie = "_" + base64.b64encode(WEBUNTIS_SCHOOL.encode()).decode()
     session.cookies.set("schoolname", school_cookie, domain=WEBUNTIS_SERVER, path="/WebUntis")
-
     url = f"https://{WEBUNTIS_SERVER}/WebUntis/j_spring_security_check"
     data = {
         "school": WEBUNTIS_SCHOOL,
@@ -72,20 +70,10 @@ def login(session):
     print("✅ Logget inn")
 
 
-def get_notes(session):
+def get_timetable_periods(session):
+    """Hent alle timer for uken via weekly timetable"""
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
-    sunday = monday + timedelta(days=6)
-
-    # Format: 2026-03-09T00:00:00
-    start = monday.strftime("%Y-%m-%dT00%%3A00%%3A00")
-    end = sunday.strftime("%Y-%m-%dT23%%3A59%%3A59")
-
-    url = (f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v2/calendar-entry/detail"
-           f"?elementId={WEBUNTIS_ELEMENT_ID}&elementType=5"
-           f"&endDateTime={sunday.strftime('%Y-%m-%dT23:59:59')}"
-           f"&homeworkOption=DUE"
-           f"&startDateTime={monday.strftime('%Y-%m-%dT00:00:00')}")
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -94,50 +82,104 @@ def get_notes(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    resp = session.get(url, headers=headers)
-    print(f"Calendar API status: {resp.status_code}")
-    print(f"Respons: {resp.text[:800]}")
+    url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/public/timetable/weekly/data"
+    params = {
+        "elementType": 5,
+        "elementId": WEBUNTIS_ELEMENT_ID,
+        "date": monday.strftime("%Y-%m-%d"),
+        "formatId": 1
+    }
 
-    if resp.status_code != 200 or not resp.text.strip().startswith("{"):
-        return []
+    resp = session.get(url, params=params, headers=headers)
+    print(f"Weekly timetable status: {resp.status_code}")
+    print(f"Respons: {resp.text[:600]}")
+    return resp
 
-    data = resp.json()
+
+def get_notes(session):
+    today = datetime.now()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
+    }
+
     notes = []
 
-    # Parse responsen
-    entries = data.get("data", data) if isinstance(data.get("data"), list) else []
-    if not entries and isinstance(data, list):
-        entries = data
+    # Hent ukentlig timeplan for å få alle timer med tider
+    weekly_resp = get_timetable_periods(session)
+    if weekly_resp.status_code == 200 and weekly_resp.text.strip().startswith("{"):
+        data = weekly_resp.json()
+        result = data.get("data", {}).get("result", {}).get("data", {})
+        elements = result.get("elements", [])
+        element_periods = result.get("elementPeriods", {})
 
-    print(f"Antall entries: {len(entries)}")
+        subject_map = {e["id"]: e.get("name", "Ukjent") for e in elements if e.get("type") == 3}
 
-    for entry in entries:
-        # Finn notater/lstext
-        lstext = (entry.get("lstext") or entry.get("lessonText") or
-                  entry.get("studentGroup") or entry.get("text") or "").strip()
-        info = (entry.get("studentGroup") or entry.get("info") or "").strip()
+        # Gå gjennom hver time og hent detaljer
+        for key, periods in element_periods.items():
+            for period in periods:
+                start_dt = period.get("startDateTime") or ""
+                end_dt = period.get("endDateTime") or ""
 
-        # Kombiner tilgjengelig tekst
-        text = lstext or info
-        if not text:
-            continue
+                # Bygg start/end fra date+startTime+endTime hvis datetime mangler
+                if not start_dt:
+                    date_raw = str(period.get("date", ""))
+                    start_time = str(period.get("startTime", "0000")).zfill(4)
+                    end_time = str(period.get("endTime", "0000")).zfill(4)
+                    try:
+                        d = datetime.strptime(date_raw, "%Y%m%d")
+                        start_dt = d.strftime(f"%Y-%m-%dT{start_time[:2]}:{start_time[2:]}:00")
+                        end_dt = d.strftime(f"%Y-%m-%dT{end_time[:2]}:{end_time[2:]}:00")
+                    except Exception:
+                        continue
 
-        subject = (entry.get("subject") or entry.get("subjectName") or
-                   entry.get("lessonSubject") or "Ukjent fag")
+                # Kall detail-API for denne timen
+                url = (f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v2/calendar-entry/detail"
+                       f"?elementId={WEBUNTIS_ELEMENT_ID}&elementType=5"
+                       f"&endDateTime={end_dt}"
+                       f"&homeworkOption=DUE"
+                       f"&startDateTime={start_dt}")
 
-        date_raw = entry.get("date") or entry.get("startDateTime", "")[:10]
-        try:
-            due_date = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d.%m.%Y")
-        except Exception:
-            due_date = date_raw
+                resp = session.get(url, headers=headers)
+                if resp.status_code != 200:
+                    continue
 
-        notes.append({
-            "subject": subject,
-            "text": text,
-            "date": due_date,
-            "raw_date": date_raw,
-        })
-        print(f"  📝 {subject} ({due_date}): {text[:80]}")
+                detail = resp.json()
+                entries = detail if isinstance(detail, list) else detail.get("data", [])
+                if not isinstance(entries, list):
+                    entries = [entries]
+
+                for entry in entries:
+                    lstext = (entry.get("lstext") or entry.get("lessonText") or
+                              entry.get("text") or "").strip()
+                    if not lstext:
+                        continue
+
+                    # Finn fagnavn
+                    subject = "Ukjent fag"
+                    for el in period.get("elements", []):
+                        if el.get("type") == 3:
+                            subject = subject_map.get(el.get("id"), "Ukjent fag")
+                            break
+
+                    date_str = start_dt[:10]
+                    try:
+                        due_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+                    except Exception:
+                        due_date = date_str
+
+                    notes.append({
+                        "subject": subject,
+                        "text": lstext,
+                        "date": due_date,
+                        "raw_date": date_str,
+                    })
+                    print(f"  📝 {subject} ({due_date}): {lstext[:80]}")
 
     return notes
 
