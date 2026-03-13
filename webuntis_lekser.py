@@ -1,6 +1,5 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
-Bruker JSON-RPC for innlogging + REST API for lekser
 """
 
 import requests
@@ -47,44 +46,41 @@ def send_pushover(title: str, message: str):
     print(f"✅ Pushover-varsel sendt: {title}")
 
 
+def encode_schoolname(school: str) -> str:
+    """WebUntis koder schoolname som '_' + base64(school)"""
+    import base64
+    encoded = base64.b64encode(school.encode()).decode()
+    return f"_{encoded}"
+
+
 def login(session):
-    """Logg inn via JSON-RPC og sett riktige cookies"""
-    rpc_url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
-    params = {"school": WEBUNTIS_SCHOOL}
-    
-    payload = {
-        "id": "login",
-        "method": "authenticate",
-        "params": {
-            "user": WEBUNTIS_USERNAME,
-            "password": WEBUNTIS_PASSWORD,
-            "client": "LekseVarsler"
-        },
-        "jsonrpc": "2.0"
+    """Logg inn via j_spring_security_check og sett riktige cookies"""
+    school_cookie = encode_schoolname(WEBUNTIS_SCHOOL)
+
+    # Sett cookies FØR innlogging – slik nettleseren gjør det
+    session.cookies.set("schoolname", school_cookie, domain=WEBUNTIS_SERVER, path="/WebUntis")
+
+    url = f"https://{WEBUNTIS_SERVER}/WebUntis/j_spring_security_check"
+    data = {
+        "school": WEBUNTIS_SCHOOL,
+        "j_username": WEBUNTIS_USERNAME,
+        "j_password": WEBUNTIS_PASSWORD,
+        "token": ""
     }
-    
     headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    resp = session.post(rpc_url, params=params, json=payload, headers=headers)
-    print(f"Login status: {resp.status_code}")
-    print(f"Login respons: {resp.text[:300]}")
+    resp = session.post(url, data=data, headers=headers, allow_redirects=True)
+    print(f"Login status: {resp.status_code}, URL: {resp.url}")
+    print(f"Cookies etter login: {dict(session.cookies)}")
 
-    data = resp.json()
-    if "error" in data:
-        raise Exception(f"Innlogging feilet: {data['error']}")
+    if "invalidLogin" in resp.url:
+        raise Exception("Innlogging feilet! Sjekk brukernavn/passord.")
 
-    session_id = data["result"]["sessionId"]
-    
-    # Sett nødvendige cookies manuelt
-    session.cookies.set("JSESSIONID", session_id, domain=WEBUNTIS_SERVER)
-    session.cookies.set("schoolname", f"_{WEBUNTIS_SCHOOL}", domain=WEBUNTIS_SERVER)
-    session.cookies.set("Tenant-Id", WEBUNTIS_SCHOOL, domain=WEBUNTIS_SERVER)
-
-    print(f"✅ Logget inn, session: {session_id[:10]}...")
-    return session
+    print("✅ Logget inn")
 
 
 def get_homework(session):
@@ -110,7 +106,7 @@ def get_homework(session):
     print(f"Respons (første 300 tegn): {resp.text[:300]}")
 
     if resp.status_code != 200 or not resp.text.strip().startswith("{"):
-        print("Fikk ikke JSON – returnerer tom liste")
+        print("Fikk ikke JSON fra lekse-API")
         return []
 
     data = resp.json()
@@ -138,14 +134,6 @@ def get_homework(session):
     return homeworks
 
 
-def logout(session):
-    rpc_url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
-    params = {"school": WEBUNTIS_SCHOOL}
-    payload = {"id": "logout", "method": "logout", "params": {}, "jsonrpc": "2.0"}
-    session.post(rpc_url, params=params, json=payload)
-    print("✅ Logget ut")
-
-
 def main():
     print(f"🕐 Kjører sjekk: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
@@ -157,12 +145,8 @@ def main():
     today = datetime.now()
 
     session = requests.Session()
-
-    try:
-        login(session)
-        homeworks = get_homework(session)
-    finally:
-        logout(session)
+    login(session)
+    homeworks = get_homework(session)
 
     print(f"📋 Fant {len(homeworks)} lekser denne uken")
 
@@ -177,7 +161,7 @@ def main():
         if today.weekday() == 0:
             send_pushover("📚 Lekser denne uken", "Ingen lekser denne uken! 🎉")
         else:
-            print("Ingen lekser, men ikke mandag – ingen varsling.")
+            print("Ingen lekser – ingen varsling.")
     elif new_homeworks:
         lines = []
         for hw in sorted(new_homeworks, key=lambda x: x.get("raw_date", "")):
@@ -194,4 +178,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
