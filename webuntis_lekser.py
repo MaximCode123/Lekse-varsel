@@ -70,8 +70,7 @@ def login(session):
     print("✅ Logget inn")
 
 
-def get_timetable_periods(session):
-    """Hent alle timer for uken via weekly timetable"""
+def get_notes(session):
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
 
@@ -82,6 +81,7 @@ def get_timetable_periods(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
+    # Hent ukentlig timeplan
     url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/public/timetable/weekly/data"
     params = {
         "elementType": 5,
@@ -89,97 +89,119 @@ def get_timetable_periods(session):
         "date": monday.strftime("%Y-%m-%d"),
         "formatId": 1
     }
-
     resp = session.get(url, params=params, headers=headers)
-    print(f"Weekly timetable status: {resp.status_code}")
-    print(f"Respons: {resp.text[:600]}")
-    return resp
+    data = resp.json()
+    result = data.get("data", {}).get("result", {}).get("data", {})
+    elements = result.get("elements", [])
+    periods = result.get("elementPeriods", {}).get(str(WEBUNTIS_ELEMENT_ID), [])
 
-
-def get_notes(session):
-    today = datetime.now()
-    monday = today - timedelta(days=today.weekday())
-    sunday = monday + timedelta(days=6)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
-    }
+    subject_map = {e["id"]: e.get("name", "Ukjent") for e in elements if e.get("type") == 3}
+    print(f"Fant {len(periods)} timer denne uken")
 
     notes = []
 
-    # Hent ukentlig timeplan for å få alle timer med tider
-    weekly_resp = get_timetable_periods(session)
-    if weekly_resp.status_code == 200 and weekly_resp.text.strip().startswith("{"):
-        data = weekly_resp.json()
-        result = data.get("data", {}).get("result", {}).get("data", {})
-        elements = result.get("elements", [])
-        element_periods = result.get("elementPeriods", {})
+    # Sjekk første time for å se hva detail-API returnerer
+    first_logged = False
+    for period in periods:
+        date_raw = str(period.get("date", ""))
+        start_time = str(period.get("startTime", "0000")).zfill(4)
+        end_time = str(period.get("endTime", "0000")).zfill(4)
 
-        subject_map = {e["id"]: e.get("name", "Ukjent") for e in elements if e.get("type") == 3}
+        try:
+            d = datetime.strptime(date_raw, "%Y%m%d")
+            start_dt = d.strftime(f"%Y-%m-%dT{start_time[:2]}:{start_time[2:]}:00")
+            end_dt = d.strftime(f"%Y-%m-%dT{end_time[:2]}:{end_time[2:]}:00")
+        except Exception:
+            continue
 
-        # Gå gjennom hver time og hent detaljer
-        for key, periods in element_periods.items():
-            for period in periods:
-                start_dt = period.get("startDateTime") or ""
-                end_dt = period.get("endDateTime") or ""
+        detail_url = (
+            f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v2/calendar-entry/detail"
+            f"?elementId={WEBUNTIS_ELEMENT_ID}&elementType=5"
+            f"&endDateTime={end_dt}"
+            f"&homeworkOption=DUE"
+            f"&startDateTime={start_dt}"
+        )
 
-                # Bygg start/end fra date+startTime+endTime hvis datetime mangler
-                if not start_dt:
-                    date_raw = str(period.get("date", ""))
-                    start_time = str(period.get("startTime", "0000")).zfill(4)
-                    end_time = str(period.get("endTime", "0000")).zfill(4)
-                    try:
-                        d = datetime.strptime(date_raw, "%Y%m%d")
-                        start_dt = d.strftime(f"%Y-%m-%dT{start_time[:2]}:{start_time[2:]}:00")
-                        end_dt = d.strftime(f"%Y-%m-%dT{end_time[:2]}:{end_time[2:]}:00")
-                    except Exception:
-                        continue
+        detail_resp = session.get(detail_url, headers=headers)
 
-                # Kall detail-API for denne timen
-                url = (f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v2/calendar-entry/detail"
-                       f"?elementId={WEBUNTIS_ELEMENT_ID}&elementType=5"
-                       f"&endDateTime={end_dt}"
-                       f"&homeworkOption=DUE"
-                       f"&startDateTime={start_dt}")
+        # Log de første 3 timene for å forstå strukturen
+        if not first_logged or period.get("lessonText", ""):
+            print(f"\nTime {start_dt}: status={detail_resp.status_code}")
+            print(f"  URL: ...{detail_url[-100:]}")
+            print(f"  Respons: {detail_resp.text[:400]}")
+            first_logged = True
 
-                resp = session.get(url, headers=headers)
-                if resp.status_code != 200:
-                    continue
+        if detail_resp.status_code != 200:
+            continue
 
-                detail = resp.json()
-                entries = detail if isinstance(detail, list) else detail.get("data", [])
-                if not isinstance(entries, list):
-                    entries = [entries]
+        detail = detail_resp.json()
 
-                for entry in entries:
-                    lstext = (entry.get("lstext") or entry.get("lessonText") or
-                              entry.get("text") or "").strip()
-                    if not lstext:
-                        continue
+        # Håndter ulike strukturer
+        if isinstance(detail, list):
+            entries = detail
+        elif isinstance(detail, dict):
+            entries = detail.get("data", [detail])
+            if not isinstance(entries, list):
+                entries = [entries]
+        else:
+            continue
 
-                    # Finn fagnavn
-                    subject = "Ukjent fag"
-                    for el in period.get("elements", []):
-                        if el.get("type") == 3:
-                            subject = subject_map.get(el.get("id"), "Ukjent fag")
-                            break
+        for entry in entries:
+            # Søk etter tekst i alle mulige felt
+            text_fields = ["lstext", "lessonText", "text", "periodText",
+                          "studentText", "teacherText", "info", "remark"]
+            text = ""
+            for field in text_fields:
+                val = entry.get(field, "").strip()
+                if val:
+                    text = val
+                    break
 
-                    date_str = start_dt[:10]
-                    try:
-                        due_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
-                    except Exception:
-                        due_date = date_str
+            if not text:
+                continue
 
-                    notes.append({
-                        "subject": subject,
-                        "text": lstext,
-                        "date": due_date,
-                        "raw_date": date_str,
-                    })
-                    print(f"  📝 {subject} ({due_date}): {lstext[:80]}")
+            subject = "Ukjent fag"
+            for el in period.get("elements", []):
+                if el.get("type") == 3:
+                    subject = subject_map.get(el.get("id"), "Ukjent fag")
+                    break
+
+            due_date = d.strftime("%d.%m.%Y")
+            notes.append({
+                "subject": subject,
+                "text": text,
+                "date": due_date,
+                "raw_date": d.strftime("%Y-%m-%d"),
+            })
+            print(f"  📝 {subject} ({due_date}): {text[:80]}")
+
+    # Sjekk også lessonText direkte fra timeplanen
+    print("\n--- Sjekker lessonText direkte fra timeplan ---")
+    for period in periods:
+        lstext = period.get("lessonText", "").strip()
+        period_text = period.get("periodText", "").strip()
+        if lstext or period_text:
+            date_raw = str(period.get("date", ""))
+            try:
+                d = datetime.strptime(date_raw, "%Y%m%d")
+                due_date = d.strftime("%d.%m.%Y")
+            except Exception:
+                due_date = date_raw
+
+            subject = "Ukjent fag"
+            for el in period.get("elements", []):
+                if el.get("type") == 3:
+                    subject = subject_map.get(el.get("id"), "Ukjent fag")
+                    break
+
+            text = lstext or period_text
+            print(f"  📝 lessonText: {subject} ({due_date}): {text[:80]}")
+            notes.append({
+                "subject": subject,
+                "text": text,
+                "date": due_date,
+                "raw_date": d.strftime("%Y-%m-%d") if isinstance(d, datetime) else date_raw,
+            })
 
     return notes
 
@@ -198,7 +220,17 @@ def main():
     login(session)
     notes = get_notes(session)
 
-    print(f"\n📋 Fant {len(notes)} notater denne uken")
+    # Dedupliser
+    seen_texts = set()
+    unique_notes = []
+    for n in notes:
+        nid = note_id(n["subject"], n["text"], n["date"])
+        if nid not in seen_texts:
+            seen_texts.add(nid)
+            unique_notes.append(n)
+    notes = unique_notes
+
+    print(f"\n📋 Fant {len(notes)} unike notater denne uken")
 
     new_notes = []
     for n in notes:
