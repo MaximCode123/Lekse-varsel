@@ -81,9 +81,15 @@ def login(session):
     print(f"Token respons: {token_resp.text[:200]}")
 
     if token_resp.status_code == 200:
-        token_data = token_resp.json()
-        bearer = token_data.get("token") or token_data.get("access_token") or str(token_data)
-        print(f"✅ Fikk token: {bearer[:30]}...")
+        raw = token_resp.text.strip()
+        # Token kan være ren tekst eller JSON
+        try:
+            import json as _json
+            token_data = _json.loads(raw)
+            bearer = token_data.get("token") or token_data.get("access_token") or raw
+        except Exception:
+            bearer = raw  # Ren tekst-token
+        print(f"✅ Fikk token ({len(bearer)} tegn)")
         return bearer
     return None
 
@@ -230,3 +236,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
