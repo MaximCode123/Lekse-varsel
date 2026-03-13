@@ -1,5 +1,6 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
+Bruker JSON-RPC for innlogging + REST API for lekser
 """
 
 import requests
@@ -47,29 +48,42 @@ def send_pushover(title: str, message: str):
 
 
 def login(session):
-    """Logg inn og sett skolecookie"""
-    # Sett skolenavn som cookie først
-    session.cookies.set("schoolname", WEBUNTIS_SCHOOL, domain=WEBUNTIS_SERVER)
-
-    url = f"https://{WEBUNTIS_SERVER}/WebUntis/j_spring_security_check"
-    data = {
-        "school": WEBUNTIS_SCHOOL,
-        "j_username": WEBUNTIS_USERNAME,
-        "j_password": WEBUNTIS_PASSWORD,
-        "token": ""
+    """Logg inn via JSON-RPC og sett riktige cookies"""
+    rpc_url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
+    params = {"school": WEBUNTIS_SCHOOL}
+    
+    payload = {
+        "id": "login",
+        "method": "authenticate",
+        "params": {
+            "user": WEBUNTIS_USERNAME,
+            "password": WEBUNTIS_PASSWORD,
+            "client": "LekseVarsler"
+        },
+        "jsonrpc": "2.0"
     }
+    
     headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "Mozilla/5.0",
-        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
     }
-    resp = session.post(url, data=data, headers=headers, allow_redirects=True)
 
-    if "invalidLogin" in resp.url or "error" in resp.url.lower():
-        raise Exception(f"Innlogging feilet! URL: {resp.url}")
+    resp = session.post(rpc_url, params=params, json=payload, headers=headers)
+    print(f"Login status: {resp.status_code}")
+    print(f"Login respons: {resp.text[:300]}")
 
-    print(f"✅ Logget inn")
-    print(f"   Cookies: {dict(session.cookies)}")
+    data = resp.json()
+    if "error" in data:
+        raise Exception(f"Innlogging feilet: {data['error']}")
+
+    session_id = data["result"]["sessionId"]
+    
+    # Sett nødvendige cookies manuelt
+    session.cookies.set("JSESSIONID", session_id, domain=WEBUNTIS_SERVER)
+    session.cookies.set("schoolname", f"_{WEBUNTIS_SCHOOL}", domain=WEBUNTIS_SERVER)
+    session.cookies.set("Tenant-Id", WEBUNTIS_SCHOOL, domain=WEBUNTIS_SERVER)
+
+    print(f"✅ Logget inn, session: {session_id[:10]}...")
     return session
 
 
@@ -86,16 +100,17 @@ def get_homework(session):
     params = {"startDate": start, "endDate": end}
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
     resp = session.get(url, params=params, headers=headers)
     print(f"Homework API status: {resp.status_code}")
-    print(f"Respons (første 500 tegn): {resp.text[:500]}")
+    print(f"Respons (første 300 tegn): {resp.text[:300]}")
 
-    if resp.status_code != 200 or not resp.text.strip():
-        print("Tom eller ugyldig respons fra lekse-API")
+    if resp.status_code != 200 or not resp.text.strip().startswith("{"):
+        print("Fikk ikke JSON – returnerer tom liste")
         return []
 
     data = resp.json()
@@ -123,6 +138,14 @@ def get_homework(session):
     return homeworks
 
 
+def logout(session):
+    rpc_url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
+    params = {"school": WEBUNTIS_SCHOOL}
+    payload = {"id": "logout", "method": "logout", "params": {}, "jsonrpc": "2.0"}
+    session.post(rpc_url, params=params, json=payload)
+    print("✅ Logget ut")
+
+
 def main():
     print(f"🕐 Kjører sjekk: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
@@ -134,8 +157,12 @@ def main():
     today = datetime.now()
 
     session = requests.Session()
-    login(session)
-    homeworks = get_homework(session)
+
+    try:
+        login(session)
+        homeworks = get_homework(session)
+    finally:
+        logout(session)
 
     print(f"📋 Fant {len(homeworks)} lekser denne uken")
 
@@ -167,3 +194,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
