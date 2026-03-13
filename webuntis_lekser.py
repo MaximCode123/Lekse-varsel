@@ -1,5 +1,6 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
+Bruker JSON-RPC for å hente timeplan og notater
 """
 
 import requests
@@ -64,120 +65,102 @@ def login(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
     resp = session.post(url, data=data, headers=headers, allow_redirects=True)
-    print(f"Login status: {resp.status_code}, URL: {resp.url}")
+    print(f"Login status: {resp.status_code}")
     if "invalidLogin" in resp.url:
         raise Exception("Innlogging feilet!")
     print("✅ Logget inn")
 
 
-def get_student_id(session):
-    """Hent innlogget brukers person-ID og elev-ID"""
+def rpc_call(session, method, params={}):
+    url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
+    payload = {"id": method, "method": method, "params": params, "jsonrpc": "2.0"}
     headers = {
+        "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    # Prøv å hente brukerinfo
-    for url in [
-        f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v1/profile",
-        f"https://{WEBUNTIS_SERVER}/WebUntis/api/profile",
-        f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v1/auth/currentUser",
-    ]:
-        resp = session.get(url, headers=headers)
-        print(f"Profile {url.split('/')[-1]}: {resp.status_code} - {resp.text[:300]}")
-        if resp.status_code == 200 and resp.text.strip().startswith("{"):
-            data = resp.json()
-            # Finn ID i ulike felt
-            person_id = (data.get("personId") or data.get("id") or
-                        data.get("data", {}).get("personId") or
-                        data.get("data", {}).get("id"))
-            if person_id:
-                print(f"✅ Fant person ID: {person_id}")
-                return person_id
-
-    # Prøv via JSON-RPC getCurrentSchoolyear for å bekrefte innlogging
-    rpc_url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
-    for method in ["getLatestImportTime", "getCurrentSchoolyear"]:
-        payload = {"id": method, "method": method, "params": {}, "jsonrpc": "2.0"}
-        resp = session.post(rpc_url, json=payload, headers=headers,
-                           params={"school": WEBUNTIS_SCHOOL})
-        print(f"RPC {method}: {resp.status_code} - {resp.text[:200]}")
-
-    return None
-
-
-def get_timetable_with_notes(session, student_id=None):
-    """Hent timeplan med notater"""
-    today = datetime.now()
-    monday = today - timedelta(days=today.weekday())
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
+    resp = session.post(url, json=payload, headers=headers,
+                        params={"school": WEBUNTIS_SCHOOL})
+    data = resp.json()
+    if "error" in data:
+        print(f"RPC feil for {method}: {data['error']}")
+        return None
+    return data.get("result")
 
-    # Prøv med elementType=5 (student/meg selv) og elementId fra student_id
-    date_str = monday.strftime("%Y-%m-%d")
 
-    urls_to_try = [
-        f"/WebUntis/api/public/timetable/weekly/data?elementType=5&elementId={student_id}&date={date_str}" if student_id else None,
-        f"/WebUntis/api/public/timetable/weekly/data?elementType=5&date={date_str}&formatId=1",
-        f"/WebUntis/api/timetable/weekly/data?elementType=5&date={date_str}",
-    ]
+def get_notes(session):
+    today = datetime.now()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+    start = int(monday.strftime("%Y%m%d"))
+    end = int(sunday.strftime("%Y%m%d"))
+
+    # Hent brukerinfo via getStudents / getPersonId
+    person_id = None
+    person_type = 5  # 5 = student
+
+    # Prøv å hente min egen ID
+    students = rpc_call(session, "getStudents")
+    print(f"getStudents: {str(students)[:300]}")
+
+    if students:
+        for s in students:
+            if s.get("name", "").lower() == WEBUNTIS_USERNAME.lower() or \
+               s.get("longName", "").lower() == WEBUNTIS_USERNAME.lower():
+                person_id = s.get("id")
+                print(f"✅ Fant student ID: {person_id} ({s.get('longName')})")
+                break
+
+        if not person_id and students:
+            # Vis første 5 studenter for debugging
+            print("Første studenter:", [(s.get("id"), s.get("name"), s.get("longName")) for s in students[:5]])
+
+    # Hent timeplan
+    params = {
+        "id": person_id or 0,
+        "type": person_type,
+        "startDate": start,
+        "endDate": end,
+        "fields": ["id", "date", "startTime", "endTime", "subjects", "lstext", "activityType"]
+    }
+
+    timetable = rpc_call(session, "getTimetable", params)
+    print(f"getTimetable: fant {len(timetable) if timetable else 0} timer")
+    if timetable:
+        print(f"Eksempel time: {timetable[0]}")
 
     notes = []
-    for url_path in urls_to_try:
-        if not url_path:
+    if not timetable:
+        return notes
+
+    # Hent faginfo
+    subjects_list = rpc_call(session, "getSubjects") or []
+    subject_map = {s["id"]: s.get("name", s.get("longName", "Ukjent")) for s in subjects_list}
+
+    for period in timetable:
+        lstext = period.get("lstext", "").strip()
+        if not lstext:
             continue
-        url = f"https://{WEBUNTIS_SERVER}{url_path}"
-        resp = session.get(url, headers=headers)
-        print(f"\nTimeplan URL: {url_path[:80]}")
-        print(f"Status: {resp.status_code}")
-        print(f"Respons: {resp.text[:600]}")
 
-        if resp.status_code != 200 or not resp.text.strip().startswith("{"):
-            continue
+        # Finn fagnavn
+        subject = "Ukjent fag"
+        subj_ids = [s["id"] for s in period.get("su", period.get("subjects", []))]
+        if subj_ids:
+            subject = subject_map.get(subj_ids[0], "Ukjent fag")
 
-        data = resp.json()
-        result = (data.get("data", {}).get("result", {}).get("data", {})
-                  or data.get("data", {}))
+        date_raw = str(period.get("date", ""))
+        try:
+            due_date = datetime.strptime(date_raw, "%Y%m%d").strftime("%d.%m.%Y")
+        except Exception:
+            due_date = date_raw
 
-        elements = result.get("elements", [])
-        element_periods = result.get("elementPeriods", {})
-
-        for key, periods in element_periods.items():
-            for period in periods:
-                lstext = period.get("lstext", "").strip()
-                if not lstext:
-                    continue
-
-                subject = "Ukjent fag"
-                for el in period.get("elements", []):
-                    if el.get("type") == 3:
-                        for elem in elements:
-                            if elem.get("type") == 3 and elem.get("id") == el.get("id"):
-                                subject = elem.get("name", "Ukjent fag")
-                                break
-
-                date_raw = str(period.get("date", ""))
-                try:
-                    due_date = datetime.strptime(date_raw, "%Y%m%d").strftime("%d.%m.%Y")
-                except Exception:
-                    due_date = date_raw
-
-                notes.append({
-                    "subject": subject,
-                    "text": lstext,
-                    "date": due_date,
-                    "raw_date": date_raw,
-                })
-                print(f"  ✅ Notat: {subject} - {lstext[:60]}")
-
-        if notes:
-            return notes
+        notes.append({
+            "subject": subject,
+            "text": lstext,
+            "date": due_date,
+            "raw_date": date_raw,
+        })
+        print(f"  📝 {subject} ({due_date}): {lstext[:80]}")
 
     return notes
 
@@ -194,9 +177,7 @@ def main():
 
     session = requests.Session()
     login(session)
-
-    student_id = get_student_id(session)
-    notes = get_timetable_with_notes(session, student_id)
+    notes = get_notes(session)
 
     print(f"\n📋 Fant {len(notes)} notater denne uken")
 
