@@ -1,5 +1,6 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
+Henter "Notater for elever" fra timeplanen via JSON-RPC
 """
 
 import requests
@@ -31,8 +32,8 @@ def save_seen_homework(seen: set):
         json.dump(list(seen), f)
 
 
-def homework_id(subject, text, date) -> str:
-    key = f"{date}-{subject}-{str(text)[:50]}"
+def note_id(subject, text, date) -> str:
+    key = f"{date}-{subject}-{str(text)[:80]}"
     return hashlib.md5(key.encode()).hexdigest()
 
 
@@ -63,41 +64,43 @@ def login(session):
         "User-Agent": "Mozilla/5.0",
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
-
     resp = session.post(url, data=data, headers=headers, allow_redirects=True)
     print(f"Login status: {resp.status_code}, URL: {resp.url}")
-
     if "invalidLogin" in resp.url:
-        raise Exception("Innlogging feilet! Sjekk brukernavn/passord.")
-
+        raise Exception("Innlogging feilet!")
     print("✅ Logget inn")
 
 
-def get_user_info(session):
-    """Hent info om innlogget bruker (person-ID, klasse-ID osv)"""
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
+def rpc(session, method, params):
+    """Kall WebUntis JSON-RPC API"""
+    url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
+    payload = {
+        "id": method,
+        "method": method,
+        "params": params,
+        "jsonrpc": "2.0"
     }
-
-    # Hent brukerinfo
-    url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v1/app/data"
-    resp = session.get(url, headers=headers)
-    print(f"App data status: {resp.status_code}")
-    print(f"App data respons: {resp.text[:500]}")
-
-    if resp.status_code == 200 and resp.text.strip().startswith("{"):
-        return resp.json()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
+    }
+    resp = session.post(url, json=payload, headers=headers,
+                        params={"school": WEBUNTIS_SCHOOL})
+    print(f"RPC {method}: {resp.status_code} - {resp.text[:200]}")
+    if resp.status_code == 200:
+        return resp.json().get("result")
     return None
 
 
-def get_homework(session):
+def get_notes_from_timetable(session):
+    """Hent timeplanen og finn alle timer med notater for elever"""
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
-    start = monday.strftime("%Y-%m-%d")
-    end = sunday.strftime("%Y-%m-%d")
+
+    start = int(monday.strftime("%Y%m%d"))
+    end = int(sunday.strftime("%Y%m%d"))
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -106,55 +109,49 @@ def get_homework(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    # Prøv REST v1 API
-    endpoints = [
-        f"/WebUntis/api/rest/view/v1/homeworks?startDate={start}&endDate={end}",
-        f"/WebUntis/api/rest/view/v1/students/me/homeworks?startDate={start}&endDate={end}",
-        f"/WebUntis/api/homeworks?startDate={start}&endDate={end}",
-        f"/WebUntis/api/classreg/homework/lessons?startDate={start}&endDate={end}",
-    ]
+    # Hent min timeplan via REST
+    url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/public/timetable/weekly/data"
+    params = {"elementType": 5, "date": monday.strftime("%Y-%m-%d")}
+    resp = session.get(url, params=params, headers=headers)
+    print(f"Timetable status: {resp.status_code}")
+    print(f"Timetable respons: {resp.text[:500]}")
 
-    for endpoint in endpoints:
-        url = f"https://{WEBUNTIS_SERVER}{endpoint}"
-        resp = session.get(url, headers=headers)
-        print(f"Prøver {endpoint.split('?')[0]}: status {resp.status_code}")
-        print(f"  Respons: {resp.text[:300]}")
+    notes = []
+    if resp.status_code == 200 and resp.text.strip().startswith("{"):
+        data = resp.json()
+        elements = data.get("data", {}).get("result", {}).get("data", {}).get("elements", [])
+        lesson_data = data.get("data", {}).get("result", {}).get("data", {}).get("elementPeriods", {})
 
-        if resp.status_code == 200 and resp.text.strip().startswith("{"):
-            data = resp.json()
-            homeworks = []
+        for key, periods in lesson_data.items():
+            for period in periods:
+                lstext = period.get("lstext", "").strip()
+                if not lstext:
+                    continue
 
-            # Prøv ulike datastrukturer
-            hw_list = (data.get("data", {}).get("homeworks")
-                      or data.get("homeworks")
-                      or data.get("data") if isinstance(data.get("data"), list) else None
-                      or [])
+                # Finn fagnavn
+                subject = "Ukjent fag"
+                for el in period.get("elements", []):
+                    if el.get("type") == 3:  # type 3 = fag
+                        for elem in elements:
+                            if elem.get("type") == 3 and elem.get("id") == el.get("id"):
+                                subject = elem.get("name", elem.get("longName", "Ukjent fag"))
+                                break
 
-            lessons = {l["id"]: l.get("subject", "Ukjent fag")
-                      for l in (data.get("data", {}).get("lessons", [])
-                                or data.get("lessons", []))}
-
-            for hw in hw_list:
-                lesson_id = hw.get("lessonId")
-                subject = lessons.get(lesson_id, hw.get("subject", hw.get("subjectName", "Ukjent fag")))
-                date_raw = str(hw.get("dueDate", hw.get("date", hw.get("endDate", ""))))
+                date_raw = str(period.get("date", ""))
                 try:
-                    fmt = "%Y-%m-%d" if "-" in date_raw else "%Y%m%d"
-                    due_date = datetime.strptime(date_raw, fmt).strftime("%d.%m.%Y")
+                    due_date = datetime.strptime(date_raw, "%Y%m%d").strftime("%d.%m.%Y")
                 except Exception:
                     due_date = date_raw
 
-                homeworks.append({
+                notes.append({
                     "subject": subject,
-                    "text": hw.get("text", hw.get("remark", hw.get("description", ""))).strip(),
+                    "text": lstext,
                     "date": due_date,
                     "raw_date": date_raw,
                 })
+                print(f"  Fant notat: {subject} - {lstext[:60]}")
 
-            print(f"  Fant {len(homeworks)} lekser via {endpoint.split('?')[0]}")
-            return homeworks
-
-    return []
+    return notes
 
 
 def main():
@@ -164,42 +161,37 @@ def main():
                 WEBUNTIS_PASSWORD, PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN]):
         raise Exception("Mangler miljøvariabler! Sjekk GitHub Secrets.")
 
-    seen_homework = load_seen_homework()
+    seen = load_seen_homework()
     today = datetime.now()
 
     session = requests.Session()
     login(session)
-    
-    # Hent brukerinfo for debugging
-    get_user_info(session)
-    
-    homeworks = get_homework(session)
+    notes = get_notes_from_timetable(session)
 
-    print(f"📋 Fant {len(homeworks)} lekser denne uken")
+    print(f"📋 Fant {len(notes)} notater denne uken")
 
-    new_homeworks = []
-    for hw in homeworks:
-        hid = homework_id(hw["subject"], hw["text"], hw["date"])
-        if hid not in seen_homework:
-            new_homeworks.append(hw)
-            seen_homework.add(hid)
+    new_notes = []
+    for n in notes:
+        nid = note_id(n["subject"], n["text"], n["date"])
+        if nid not in seen:
+            new_notes.append(n)
+            seen.add(nid)
 
-    if not homeworks:
+    if not notes:
         if today.weekday() == 0:
             send_pushover("📚 Lekser denne uken", "Ingen lekser denne uken! 🎉")
         else:
-            print("Ingen lekser – ingen varsling.")
-    elif new_homeworks:
+            print("Ingen notater – ingen varsling.")
+    elif new_notes:
         lines = []
-        for hw in sorted(new_homeworks, key=lambda x: x.get("raw_date", "")):
-            lines.append(f"📚 {hw['subject']} ({hw['date']})")
-            if hw["text"]:
-                lines.append(f"   {hw['text']}")
-        send_pushover(f"📚 {len(new_homeworks)} ny(e) lekse(r)!", "\n".join(lines))
+        for n in sorted(new_notes, key=lambda x: x.get("raw_date", "")):
+            lines.append(f"📚 {n['subject']} ({n['date']})")
+            lines.append(f"   {n['text']}")
+        send_pushover(f"📚 {len(new_notes)} ny(e) lekse(r)!", "\n".join(lines))
     else:
-        print("Ingen nye lekser siden siste sjekk.")
+        print("Ingen nye notater siden siste sjekk.")
 
-    save_seen_homework(seen_homework)
+    save_seen_homework(seen)
     print("✅ Ferdig!")
 
 
