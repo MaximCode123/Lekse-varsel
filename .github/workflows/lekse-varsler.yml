@@ -1,0 +1,40 @@
+name: Lekse-varsler
+
+on:
+  schedule:
+    - cron: '0 5-21 * * *'
+  workflow_dispatch:
+
+jobs:
+  sjekk-lekser:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Hent kode
+        uses: actions/checkout@v4
+
+      - name: Last inn lekse-historikk (cache)
+        uses: actions/cache@v4
+        with:
+          path: seen_homework.json
+          key: seen-homework-${{ github.run_id }}
+          restore-keys: |
+            seen-homework-
+
+      - name: Sett opp Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer avhengigheter
+        run: pip install requests
+
+      - name: Kjør lekse-sjekk
+        env:
+          WEBUNTIS_SERVER:   ${{ secrets.WEBUNTIS_SERVER }}
+          WEBUNTIS_SCHOOL:   ${{ secrets.WEBUNTIS_SCHOOL }}
+          WEBUNTIS_USERNAME: ${{ secrets.WEBUNTIS_USERNAME }}
+          WEBUNTIS_PASSWORD: ${{ secrets.WEBUNTIS_PASSWORD }}
+          PUSHOVER_USER_KEY:  ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+        run: python webuntis_lekser.py
