@@ -73,67 +73,87 @@ def login(session):
     print("✅ Logget inn")
 
 
+def get_user_info(session):
+    """Hent info om innlogget bruker (person-ID, klasse-ID osv)"""
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    # Hent brukerinfo
+    url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v1/app/data"
+    resp = session.get(url, headers=headers)
+    print(f"App data status: {resp.status_code}")
+    print(f"App data respons: {resp.text[:500]}")
+
+    if resp.status_code == 200 and resp.text.strip().startswith("{"):
+        return resp.json()
+    return None
+
+
 def get_homework(session):
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
-
     start = monday.strftime("%Y-%m-%d")
     end = sunday.strftime("%Y-%m-%d")
 
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "application/json",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    # Prøv flere endepunkter
+    # Prøv REST v1 API
     endpoints = [
-        f"/WebUntis/api/homeworks/lessons?startDate={start}&endDate={end}",
-        f"/WebUntis/api/classreg/homeworks?startDate={start}&endDate={end}",
-        f"/WebUntis/api/student/homeworks?startDate={start}&endDate={end}",
+        f"/WebUntis/api/rest/view/v1/homeworks?startDate={start}&endDate={end}",
+        f"/WebUntis/api/rest/view/v1/students/me/homeworks?startDate={start}&endDate={end}",
+        f"/WebUntis/api/homeworks?startDate={start}&endDate={end}",
+        f"/WebUntis/api/classreg/homework/lessons?startDate={start}&endDate={end}",
     ]
 
     for endpoint in endpoints:
         url = f"https://{WEBUNTIS_SERVER}{endpoint}"
         resp = session.get(url, headers=headers)
-        print(f"Prøver {endpoint}: status {resp.status_code}")
-        print(f"  Respons: {resp.text[:200]}")
+        print(f"Prøver {endpoint.split('?')[0]}: status {resp.status_code}")
+        print(f"  Respons: {resp.text[:300]}")
 
         if resp.status_code == 200 and resp.text.strip().startswith("{"):
             data = resp.json()
             homeworks = []
 
-            # Format 1: data.homeworks
-            hw_list = data.get("data", {}).get("homeworks", [])
-            lessons = {l["id"]: l.get("subject", "Ukjent fag")
-                      for l in data.get("data", {}).get("lessons", [])}
+            # Prøv ulike datastrukturer
+            hw_list = (data.get("data", {}).get("homeworks")
+                      or data.get("homeworks")
+                      or data.get("data") if isinstance(data.get("data"), list) else None
+                      or [])
 
-            # Format 2: direkte liste
-            if not hw_list and isinstance(data.get("data"), list):
-                hw_list = data["data"]
+            lessons = {l["id"]: l.get("subject", "Ukjent fag")
+                      for l in (data.get("data", {}).get("lessons", [])
+                                or data.get("lessons", []))}
 
             for hw in hw_list:
                 lesson_id = hw.get("lessonId")
                 subject = lessons.get(lesson_id, hw.get("subject", hw.get("subjectName", "Ukjent fag")))
-                date_raw = str(hw.get("dueDate", hw.get("date", "")))
+                date_raw = str(hw.get("dueDate", hw.get("date", hw.get("endDate", ""))))
                 try:
-                    due_date = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d.%m.%Y")
+                    fmt = "%Y-%m-%d" if "-" in date_raw else "%Y%m%d"
+                    due_date = datetime.strptime(date_raw, fmt).strftime("%d.%m.%Y")
                 except Exception:
                     due_date = date_raw
 
                 homeworks.append({
                     "subject": subject,
-                    "text": hw.get("text", hw.get("remark", "")).strip(),
+                    "text": hw.get("text", hw.get("remark", hw.get("description", ""))).strip(),
                     "date": due_date,
                     "raw_date": date_raw,
                 })
 
-            print(f"  Fant {len(homeworks)} lekser")
+            print(f"  Fant {len(homeworks)} lekser via {endpoint.split('?')[0]}")
             return homeworks
 
-    print("Ingen endepunkter fungerte")
     return []
 
 
@@ -149,6 +169,10 @@ def main():
 
     session = requests.Session()
     login(session)
+    
+    # Hent brukerinfo for debugging
+    get_user_info(session)
+    
     homeworks = get_homework(session)
 
     print(f"📋 Fant {len(homeworks)} lekser denne uken")
@@ -181,6 +205,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
