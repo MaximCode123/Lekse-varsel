@@ -66,7 +66,10 @@ def login(session):
     resp = session.post(url, data=data, headers=headers, allow_redirects=True)
     if "invalidLogin" in resp.url:
         raise Exception("Innlogging feilet!")
-    print("✅ Logget inn")
+
+    # Sett Tenant-Id cookie slik nettleseren gjør
+    session.cookies.set("Tenant-Id", '"7418800"', domain=WEBUNTIS_SERVER, path="/WebUntis")
+    print(f"✅ Logget inn, cookies: {dict(session.cookies)}")
 
 
 def get_notes(session):
