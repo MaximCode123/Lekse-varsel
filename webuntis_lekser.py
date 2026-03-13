@@ -123,7 +123,7 @@ def get_notes(session):
         detail_url = (
             f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v2/calendar-entry/detail"
             f"?elementId={WEBUNTIS_ELEMENT_ID}&elementType=5"
-            f"&endDateTime={end_dt}"
+            f"&endDateTime={end_enc}"
             f"&homeworkOption=DUE"
             f"&startDateTime={start_dt}"
         )
