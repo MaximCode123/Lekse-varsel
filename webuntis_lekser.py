@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timedelta
 import hashlib
 import base64
+from collections import defaultdict
 
 WEBUNTIS_SERVER     = os.environ.get("WEBUNTIS_SERVER", "")
 WEBUNTIS_SCHOOL     = os.environ.get("WEBUNTIS_SCHOOL", "")
@@ -18,6 +19,25 @@ PUSHOVER_USER_KEY   = os.environ.get("PUSHOVER_USER_KEY", "")
 PUSHOVER_APP_TOKEN  = os.environ.get("PUSHOVER_APP_TOKEN", "")
 
 SEEN_HOMEWORK_FILE = "seen_homework.json"
+
+# Timeplanen fra skjermbildet – dato, start, slutt
+TIMETABLE = [
+    ("20260309", "0830", "1000"),  # Man: Matematikk S1
+    ("20260309", "1245", "1415"),  # Man: Økonomistyring
+    ("20260310", "0830", "1000"),  # Tir: Norsk
+    ("20260310", "1020", "1150"),  # Tir: Informasjonsteknologi
+    ("20260310", "1245", "1415"),  # Tir: Tysk
+    ("20260311", "0830", "1000"),  # Ons: Tysk
+    ("20260311", "1020", "1150"),  # Ons: Økonomistyring
+    ("20260311", "1230", "1400"),  # Ons: Norsk
+    ("20260311", "1415", "1545"),  # Ons: Kristendomskunnskap
+    ("20260312", "0830", "1000"),  # To: Historie
+    ("20260312", "1020", "1150"),  # To: Informasjonsteknologi
+    ("20260312", "1230", "1400"),  # To: Informasjonsteknologi
+    ("20260313", "0830", "1000"),  # Fr: Matematikk S1
+    ("20260313", "1020", "1150"),  # Fr: Kroppsøving
+    ("20260313", "1230", "1400"),  # Fr: Informasjonsteknologi
+]
 
 
 def load_seen_homework():
@@ -51,6 +71,13 @@ def send_pushover(title: str, message: str):
 def login(session):
     school_cookie = "_" + base64.b64encode(WEBUNTIS_SCHOOL.encode()).decode()
     session.cookies.set("schoolname", school_cookie, domain=WEBUNTIS_SERVER, path="/WebUntis")
+
+    # Besøk siden først for å få eventuelle initielle cookies
+    session.get(
+        f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}",
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+
     url = f"https://{WEBUNTIS_SERVER}/WebUntis/j_spring_security_check"
     data = {
         "school": WEBUNTIS_SCHOOL,
@@ -66,57 +93,21 @@ def login(session):
     resp = session.post(url, data=data, headers=headers, allow_redirects=True)
     if "invalidLogin" in resp.url:
         raise Exception("Innlogging feilet!")
-    session.cookies.set("Tenant-Id", '"7418800"', domain=WEBUNTIS_SERVER, path="/WebUntis")
-    print("✅ Logget inn")
+    print(f"✅ Logget inn, cookies: {list(session.cookies.keys())}")
 
 
 def get_notes(session):
-    today = datetime.now()
-    monday = today - timedelta(days=today.weekday())
-
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
+        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/index.do#/my-timetable"
     }
-
-    # Hent ukentlig timeplan
-    url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/public/timetable/weekly/data"
-    params = {
-        "elementType": 5,
-        "elementId": WEBUNTIS_ELEMENT_ID,
-        "date": monday.strftime("%Y-%m-%d"),
-        "formatId": 1
-    }
-    resp = session.get(url, params=params, headers=headers)
-    data = resp.json()
-    result = data.get("data", {}).get("result", {}).get("data", {})
-    periods = result.get("elementPeriods", {}).get(str(WEBUNTIS_ELEMENT_ID), [])
-
-    # Grupper timer per lessonId – finn start på første og slutt på siste
-    from collections import defaultdict
-    lesson_groups = defaultdict(list)
-    for period in periods:
-        lesson_id = period.get("lessonId")
-        if lesson_id:
-            lesson_groups[lesson_id].append(period)
-
-    print(f"Fant {len(lesson_groups)} unike leksjoner denne uken")
 
     notes = []
+    seen_texts = set()
 
-    for lesson_id, lesson_periods in lesson_groups.items():
-        # Sorter etter dato og starttid
-        lesson_periods.sort(key=lambda p: (p.get("date", 0), p.get("startTime", 0)))
-
-        first = lesson_periods[0]
-        last = lesson_periods[-1]
-
-        date_raw = str(first.get("date", ""))
-        start_time = str(first.get("startTime", "0000")).zfill(4)
-        end_time = str(last.get("endTime", "0000")).zfill(4)
-
+    for date_raw, start_time, end_time in TIMETABLE:
         try:
             d = datetime.strptime(date_raw, "%Y%m%d")
             start_dt = d.strftime(f"%Y-%m-%dT{start_time[:2]}:{start_time[2:]}:00")
@@ -136,7 +127,7 @@ def get_notes(session):
         )
 
         detail_resp = session.get(detail_url, headers=headers)
-        print(f"  {start_dt} → {end_dt}: status {detail_resp.status_code}")
+        print(f"  {start_dt}: status {detail_resp.status_code}")
 
         if detail_resp.status_code != 200:
             continue
@@ -154,13 +145,16 @@ def get_notes(session):
             except Exception:
                 due_date = date_str
 
-            notes.append({
-                "subject": subject,
-                "text": notes_text,
-                "date": due_date,
-                "raw_date": date_str,
-            })
-            print(f"  📝 {subject} ({due_date}): {notes_text[:80]}")
+            nid = note_id(subject, notes_text, due_date)
+            if nid not in seen_texts:
+                seen_texts.add(nid)
+                notes.append({
+                    "subject": subject,
+                    "text": notes_text,
+                    "date": due_date,
+                    "raw_date": date_str,
+                })
+                print(f"    📝 {subject}: {notes_text[:60]}")
 
     return notes
 
@@ -178,16 +172,6 @@ def main():
     session = requests.Session()
     login(session)
     notes = get_notes(session)
-
-    # Dedupliser
-    seen_texts = set()
-    unique_notes = []
-    for n in notes:
-        nid = note_id(n["subject"], n["text"], n["date"])
-        if nid not in seen_texts:
-            seen_texts.add(nid)
-            unique_notes.append(n)
-    notes = unique_notes
 
     print(f"\n📋 Fant {len(notes)} notater denne uken")
 
