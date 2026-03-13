@@ -1,6 +1,5 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
-Henter notesAll fra calendar-entry/detail API
 """
 
 import requests
@@ -73,7 +72,6 @@ def login(session):
 def get_notes(session):
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
-    sunday = monday + timedelta(days=6)
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -82,7 +80,6 @@ def get_notes(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    # Hent ukentlig timeplan for å få alle timer
     url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/public/timetable/weekly/data"
     params = {
         "elementType": 5,
@@ -103,6 +100,11 @@ def get_notes(session):
     seen_lesson_ids = set()
 
     for period in periods:
+        lesson_id = period.get("lessonId")
+        if lesson_id in seen_lesson_ids:
+            continue
+        seen_lesson_ids.add(lesson_id)
+
         date_raw = str(period.get("date", ""))
         start_time = str(period.get("startTime", "0000")).zfill(4)
         end_time = str(period.get("endTime", "0000")).zfill(4)
@@ -114,18 +116,16 @@ def get_notes(session):
         except Exception:
             continue
 
-        # Unngå å hente samme lessonId flere ganger
-        lesson_id = period.get("lessonId")
-        if lesson_id in seen_lesson_ids:
-            continue
-        seen_lesson_ids.add(lesson_id)
+        # URL-kode koloner slik nettleseren gjør
+        start_enc = start_dt.replace(":", "%3A")
+        end_enc = end_dt.replace(":", "%3A")
 
         detail_url = (
             f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v2/calendar-entry/detail"
             f"?elementId={WEBUNTIS_ELEMENT_ID}&elementType=5"
             f"&endDateTime={end_enc}"
             f"&homeworkOption=DUE"
-            f"&startDateTime={start_dt}"
+            f"&startDateTime={start_enc}"
         )
 
         detail_resp = session.get(detail_url, headers=headers)
@@ -172,7 +172,6 @@ def main():
     login(session)
     notes = get_notes(session)
 
-    # Dedupliser
     seen_texts = set()
     unique_notes = []
     for n in notes:
