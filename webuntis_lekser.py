@@ -1,6 +1,5 @@
 """
 WebUntis Lekse-varsler til iPhone via Pushover
-Henter "Notater for elever" fra timeplanen via JSON-RPC
 """
 
 import requests
@@ -71,36 +70,47 @@ def login(session):
     print("✅ Logget inn")
 
 
-def rpc(session, method, params):
-    """Kall WebUntis JSON-RPC API"""
-    url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
-    payload = {
-        "id": method,
-        "method": method,
-        "params": params,
-        "jsonrpc": "2.0"
-    }
+def get_student_id(session):
+    """Hent innlogget brukers person-ID og elev-ID"""
     headers = {
-        "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0",
-        "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
     }
-    resp = session.post(url, json=payload, headers=headers,
-                        params={"school": WEBUNTIS_SCHOOL})
-    print(f"RPC {method}: {resp.status_code} - {resp.text[:200]}")
-    if resp.status_code == 200:
-        return resp.json().get("result")
+
+    # Prøv å hente brukerinfo
+    for url in [
+        f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v1/profile",
+        f"https://{WEBUNTIS_SERVER}/WebUntis/api/profile",
+        f"https://{WEBUNTIS_SERVER}/WebUntis/api/rest/view/v1/auth/currentUser",
+    ]:
+        resp = session.get(url, headers=headers)
+        print(f"Profile {url.split('/')[-1]}: {resp.status_code} - {resp.text[:300]}")
+        if resp.status_code == 200 and resp.text.strip().startswith("{"):
+            data = resp.json()
+            # Finn ID i ulike felt
+            person_id = (data.get("personId") or data.get("id") or
+                        data.get("data", {}).get("personId") or
+                        data.get("data", {}).get("id"))
+            if person_id:
+                print(f"✅ Fant person ID: {person_id}")
+                return person_id
+
+    # Prøv via JSON-RPC getCurrentSchoolyear for å bekrefte innlogging
+    rpc_url = f"https://{WEBUNTIS_SERVER}/WebUntis/jsonrpc.do"
+    for method in ["getLatestImportTime", "getCurrentSchoolyear"]:
+        payload = {"id": method, "method": method, "params": {}, "jsonrpc": "2.0"}
+        resp = session.post(rpc_url, json=payload, headers=headers,
+                           params={"school": WEBUNTIS_SCHOOL})
+        print(f"RPC {method}: {resp.status_code} - {resp.text[:200]}")
+
     return None
 
 
-def get_notes_from_timetable(session):
-    """Hent timeplanen og finn alle timer med notater for elever"""
+def get_timetable_with_notes(session, student_id=None):
+    """Hent timeplan med notater"""
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
-    sunday = monday + timedelta(days=6)
-
-    start = int(monday.strftime("%Y%m%d"))
-    end = int(sunday.strftime("%Y%m%d"))
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -109,32 +119,47 @@ def get_notes_from_timetable(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    # Hent min timeplan via REST
-    url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/public/timetable/weekly/data"
-    params = {"elementType": 5, "date": monday.strftime("%Y-%m-%d")}
-    resp = session.get(url, params=params, headers=headers)
-    print(f"Timetable status: {resp.status_code}")
-    print(f"Timetable respons: {resp.text[:500]}")
+    # Prøv med elementType=5 (student/meg selv) og elementId fra student_id
+    date_str = monday.strftime("%Y-%m-%d")
+
+    urls_to_try = [
+        f"/WebUntis/api/public/timetable/weekly/data?elementType=5&elementId={student_id}&date={date_str}" if student_id else None,
+        f"/WebUntis/api/public/timetable/weekly/data?elementType=5&date={date_str}&formatId=1",
+        f"/WebUntis/api/timetable/weekly/data?elementType=5&date={date_str}",
+    ]
 
     notes = []
-    if resp.status_code == 200 and resp.text.strip().startswith("{"):
-        data = resp.json()
-        elements = data.get("data", {}).get("result", {}).get("data", {}).get("elements", [])
-        lesson_data = data.get("data", {}).get("result", {}).get("data", {}).get("elementPeriods", {})
+    for url_path in urls_to_try:
+        if not url_path:
+            continue
+        url = f"https://{WEBUNTIS_SERVER}{url_path}"
+        resp = session.get(url, headers=headers)
+        print(f"\nTimeplan URL: {url_path[:80]}")
+        print(f"Status: {resp.status_code}")
+        print(f"Respons: {resp.text[:600]}")
 
-        for key, periods in lesson_data.items():
+        if resp.status_code != 200 or not resp.text.strip().startswith("{"):
+            continue
+
+        data = resp.json()
+        result = (data.get("data", {}).get("result", {}).get("data", {})
+                  or data.get("data", {}))
+
+        elements = result.get("elements", [])
+        element_periods = result.get("elementPeriods", {})
+
+        for key, periods in element_periods.items():
             for period in periods:
                 lstext = period.get("lstext", "").strip()
                 if not lstext:
                     continue
 
-                # Finn fagnavn
                 subject = "Ukjent fag"
                 for el in period.get("elements", []):
-                    if el.get("type") == 3:  # type 3 = fag
+                    if el.get("type") == 3:
                         for elem in elements:
                             if elem.get("type") == 3 and elem.get("id") == el.get("id"):
-                                subject = elem.get("name", elem.get("longName", "Ukjent fag"))
+                                subject = elem.get("name", "Ukjent fag")
                                 break
 
                 date_raw = str(period.get("date", ""))
@@ -149,7 +174,10 @@ def get_notes_from_timetable(session):
                     "date": due_date,
                     "raw_date": date_raw,
                 })
-                print(f"  Fant notat: {subject} - {lstext[:60]}")
+                print(f"  ✅ Notat: {subject} - {lstext[:60]}")
+
+        if notes:
+            return notes
 
     return notes
 
@@ -159,16 +187,18 @@ def main():
 
     if not all([WEBUNTIS_SERVER, WEBUNTIS_SCHOOL, WEBUNTIS_USERNAME,
                 WEBUNTIS_PASSWORD, PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN]):
-        raise Exception("Mangler miljøvariabler! Sjekk GitHub Secrets.")
+        raise Exception("Mangler miljøvariabler!")
 
     seen = load_seen_homework()
     today = datetime.now()
 
     session = requests.Session()
     login(session)
-    notes = get_notes_from_timetable(session)
 
-    print(f"📋 Fant {len(notes)} notater denne uken")
+    student_id = get_student_id(session)
+    notes = get_timetable_with_notes(session, student_id)
+
+    print(f"\n📋 Fant {len(notes)} notater denne uken")
 
     new_notes = []
     for n in notes:
