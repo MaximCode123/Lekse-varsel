@@ -7,6 +7,7 @@ import json
 import os
 from datetime import datetime, timedelta
 import hashlib
+import base64
 
 WEBUNTIS_SERVER   = os.environ.get("WEBUNTIS_SERVER", "")
 WEBUNTIS_SCHOOL   = os.environ.get("WEBUNTIS_SCHOOL", "")
@@ -46,18 +47,8 @@ def send_pushover(title: str, message: str):
     print(f"✅ Pushover-varsel sendt: {title}")
 
 
-def encode_schoolname(school: str) -> str:
-    """WebUntis koder schoolname som '_' + base64(school)"""
-    import base64
-    encoded = base64.b64encode(school.encode()).decode()
-    return f"_{encoded}"
-
-
 def login(session):
-    """Logg inn via j_spring_security_check og sett riktige cookies"""
-    school_cookie = encode_schoolname(WEBUNTIS_SCHOOL)
-
-    # Sett cookies FØR innlogging – slik nettleseren gjør det
+    school_cookie = "_" + base64.b64encode(WEBUNTIS_SCHOOL.encode()).decode()
     session.cookies.set("schoolname", school_cookie, domain=WEBUNTIS_SERVER, path="/WebUntis")
 
     url = f"https://{WEBUNTIS_SERVER}/WebUntis/j_spring_security_check"
@@ -75,7 +66,6 @@ def login(session):
 
     resp = session.post(url, data=data, headers=headers, allow_redirects=True)
     print(f"Login status: {resp.status_code}, URL: {resp.url}")
-    print(f"Cookies etter login: {dict(session.cookies)}")
 
     if "invalidLogin" in resp.url:
         raise Exception("Innlogging feilet! Sjekk brukernavn/passord.")
@@ -84,7 +74,6 @@ def login(session):
 
 
 def get_homework(session):
-    """Hent lekser for denne uken"""
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
@@ -92,8 +81,6 @@ def get_homework(session):
     start = monday.strftime("%Y-%m-%d")
     end = sunday.strftime("%Y-%m-%d")
 
-    url = f"https://{WEBUNTIS_SERVER}/WebUntis/api/homeworks/lessons"
-    params = {"startDate": start, "endDate": end}
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
@@ -101,37 +88,53 @@ def get_homework(session):
         "Referer": f"https://{WEBUNTIS_SERVER}/WebUntis/?school={WEBUNTIS_SCHOOL}"
     }
 
-    resp = session.get(url, params=params, headers=headers)
-    print(f"Homework API status: {resp.status_code}")
-    print(f"Respons (første 300 tegn): {resp.text[:300]}")
+    # Prøv flere endepunkter
+    endpoints = [
+        f"/WebUntis/api/homeworks/lessons?startDate={start}&endDate={end}",
+        f"/WebUntis/api/classreg/homeworks?startDate={start}&endDate={end}",
+        f"/WebUntis/api/student/homeworks?startDate={start}&endDate={end}",
+    ]
 
-    if resp.status_code != 200 or not resp.text.strip().startswith("{"):
-        print("Fikk ikke JSON fra lekse-API")
-        return []
+    for endpoint in endpoints:
+        url = f"https://{WEBUNTIS_SERVER}{endpoint}"
+        resp = session.get(url, headers=headers)
+        print(f"Prøver {endpoint}: status {resp.status_code}")
+        print(f"  Respons: {resp.text[:200]}")
 
-    data = resp.json()
-    homeworks = []
+        if resp.status_code == 200 and resp.text.strip().startswith("{"):
+            data = resp.json()
+            homeworks = []
 
-    hw_data = data.get("data", {})
-    lessons = {l["id"]: l.get("subject", "Ukjent fag") for l in hw_data.get("lessons", [])}
+            # Format 1: data.homeworks
+            hw_list = data.get("data", {}).get("homeworks", [])
+            lessons = {l["id"]: l.get("subject", "Ukjent fag")
+                      for l in data.get("data", {}).get("lessons", [])}
 
-    for hw in hw_data.get("homeworks", []):
-        lesson_id = hw.get("lessonId")
-        subject = lessons.get(lesson_id, "Ukjent fag")
-        date_raw = str(hw.get("dueDate", ""))
-        try:
-            due_date = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d.%m.%Y")
-        except Exception:
-            due_date = date_raw
+            # Format 2: direkte liste
+            if not hw_list and isinstance(data.get("data"), list):
+                hw_list = data["data"]
 
-        homeworks.append({
-            "subject": subject,
-            "text": hw.get("text", "").strip(),
-            "date": due_date,
-            "raw_date": date_raw,
-        })
+            for hw in hw_list:
+                lesson_id = hw.get("lessonId")
+                subject = lessons.get(lesson_id, hw.get("subject", hw.get("subjectName", "Ukjent fag")))
+                date_raw = str(hw.get("dueDate", hw.get("date", "")))
+                try:
+                    due_date = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d.%m.%Y")
+                except Exception:
+                    due_date = date_raw
 
-    return homeworks
+                homeworks.append({
+                    "subject": subject,
+                    "text": hw.get("text", hw.get("remark", "")).strip(),
+                    "date": due_date,
+                    "raw_date": date_raw,
+                })
+
+            print(f"  Fant {len(homeworks)} lekser")
+            return homeworks
+
+    print("Ingen endepunkter fungerte")
+    return []
 
 
 def main():
@@ -178,5 +181,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
